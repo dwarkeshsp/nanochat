@@ -4,19 +4,20 @@ Demonstrates REINFORCE and GRPO algorithms in a minimal, clean implementation.
 """
 import random
 import time
+import os
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-from nanochat.common import compute_init, compute_cleanup
-from nanochat.checkpoint_manager import load_model
+from nanochat.common import compute_init, compute_cleanup, get_base_dir
+from nanochat.checkpoint_manager import load_model, save_checkpoint
 from nanochat.engine import Engine
 
 
 # Config
-num_steps = 25
-problems_per_batch = 16
+num_steps = 26
+problems_per_step = 16
 samples_per_problem = 16
 max_new_tokens = 256  
 temperature = 1.0  
@@ -90,7 +91,7 @@ def GRPO_loss(log_probs, rewards, advantages):
     return (log_probs * advantages.unsqueeze(-1)).sum()
 
 @torch.no_grad()
-def evaluate(engine, tokenizer, num_problems=problems_per_batch):
+def evaluate(engine, tokenizer, num_problems=problems_per_step):
     """Evaluate on validation set."""
     problem_iterator = get_problem(engine, tokenizer, number_set=val_numbers)
     total_reward = 0
@@ -116,7 +117,7 @@ def train(loss_function):
         rewards_list = []
         seq_lens = []
         
-        for problem in range(problems_per_batch):
+        for problem in range(problems_per_step):
             sequences, inputs, targets, rewards, advantages = next(problem_iterator)
             
             model.train()
@@ -125,7 +126,7 @@ def train(loss_function):
             
             pg_obj = loss_function(logp, rewards, advantages)
             num_valid = (targets >= 0).sum().clamp(min=1)
-            pg_obj = pg_obj / (num_valid * problems_per_batch)
+            pg_obj = pg_obj / (num_valid * problems_per_step)
             
             loss = -pg_obj
             loss.backward()
@@ -147,13 +148,24 @@ def train(loss_function):
         avg_seq_len = sum(seq_lens) / len(seq_lens)
         step_time = time.time() - step_start
         
-        log_msg = f"Step {step}/{num_steps} | Train: {train_reward:.2f} | Time: {step_time:.1f}s | Seq Len: {round(avg_seq_len)}"
+        log_msg = f"Step {step + 1}/{num_steps} | Train: {train_reward:.2f} | Time: {step_time:.1f}s | Seq Len: {round(avg_seq_len)}"
         if val_reward is not None:
             log_msg += f" | Val: {val_reward:.2f}"
         print(log_msg)
-        
     
-    return train_rewards, val_rewards
+    return model, train_rewards, val_rewards
+
+def save_model(model, name):
+    checkpoint_dir = os.path.join(get_base_dir(), name)
+    save_checkpoint(
+        checkpoint_dir,
+        num_steps,
+        model.state_dict(),
+        None,
+        {
+            "model_config": model.config.__dict__,
+        }
+    )
 
 def plot_rewards(reinforce_train, reinforce_val, grpo_train, grpo_val):
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -186,10 +198,11 @@ def plot_rewards(reinforce_train, reinforce_val, grpo_train, grpo_val):
 
 if __name__ == "__main__":
     print("Training REINFORCE...")  
-    reinforce_train, reinforce_val = train(REINFORCE_loss)
+    model, reinforce_train, reinforce_val = train(REINFORCE_loss)
+    save_model(model, "reinforce")
     print("Training GRPO...")
-    grpo_train, grpo_val = train(GRPO_loss)
-    
+    model, grpo_train, grpo_val = train(GRPO_loss)
+    save_model(model, "grpo")
     plot_rewards(reinforce_train, reinforce_val, grpo_train, grpo_val)
     compute_cleanup()
 
