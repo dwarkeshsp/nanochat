@@ -6,13 +6,13 @@ import random
 import torch
 import torch.nn.functional as F
 
-from nanochat.common import compute_init, compute_cleanup, print0
+from nanochat.common import compute_init, compute_cleanup
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 
 
 # Config
-num_steps = 100 
+num_steps = 1 
 problems_per_batch = 4  
 samples_per_problem = 4  
 max_new_tokens = 64  
@@ -20,7 +20,7 @@ temperature = 1.0
 top_k = 50 
 
 # Init
-source = "mid" 
+source = "sft" 
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
 model, tokenizer, meta = load_model(source, device, phase="eval")
 engine = Engine(model, tokenizer)
@@ -71,6 +71,7 @@ def get_batch():
         for sample_tokens in generated_token_sequences:
             generated_tokens = sample_tokens[prefix_length:]
             generated_text = tokenizer.decode(generated_tokens)
+            print(f"generated text: {generated_text}")
             # Simple reward: 1.0 if answer is in the text, 0.0 otherwise
             reward = 1.0 if correct_answer in generated_text else 0.0
             rewards.append(reward)
@@ -79,28 +80,33 @@ def get_batch():
         padded_sequences = [seq + [EOT_MODEL] * (max_length - len(seq)) for seq in generated_token_sequences]
         padded_masks = [mask + [0] * (max_length - len(mask)) for mask in masks]
         
-        ids = torch.tensor(padded_sequences, dtype=torch.long, device=device)  # (B, N, T)
-        mask_ids = torch.tensor(padded_masks, dtype=torch.long, device=device)  # (B, N, T)
+        ids = torch.tensor(padded_sequences, dtype=torch.long, device=device)  # (N, T)
+        mask_ids = torch.tensor(padded_masks, dtype=torch.long, device=device)  # (N, T)
 
-        inputs = ids[:, :-1]  # (B, N, T-1)
-        targets = ids[:, 1:].clone()  # (B, N, T-1)
+        inputs = ids[:, :-1]  # (N, T-1)
+        targets = ids[:, 1:].clone()  # (N, T-1)
         
         # Mask out prompt and padding tokens in targets
         targets[mask_ids[:, 1:] == 0] = -1  # -1 = ignore in loss
         
         # Compute advantages
-        rewards = torch.tensor(rewards, dtype=torch.float, device=device)  # (B, N)
+        rewards = torch.tensor(rewards, dtype=torch.float, device=device)  # (N,)
         advantages = rewards - rewards.mean() 
-        
+        print(f"generated_token_sequences shape: {len(generated_token_sequences)} x {[len(seq) for seq in generated_token_sequences]}")
+        print(f"inputs shape: {inputs.shape}")
+        print(f"targets shape: {targets.shape}")
+        print(f"rewards shape: {rewards.shape}")
+        print(f"advantages shape: {advantages.shape}")
+            
         yield generated_token_sequences, inputs, targets, rewards, advantages
 
 def REINFORCE_loss(log_probs, rewards, advantages):
     """REINFORCE: weight by absolute rewards."""
-    return -(log_probs * rewards.unsqueeze(-1)).sum()
+    return (log_probs * rewards.unsqueeze(-1)).sum()
 
 def GRPO_loss(log_probs, rewards, advantages):
     """GRPO: weight by advantages (centered rewards)."""
-    return -(log_probs * advantages.unsqueeze(-1)).sum()
+    return (log_probs * advantages.unsqueeze(-1)).sum()
 
 optimizers = model.setup_optimizers(
     unembedding_lr=0.004,
@@ -116,16 +122,19 @@ def train(loss_function):
 
         model.train()
 
+        # Calculate log probabilities. Note that the model returns NLL = -logp, so we negate
         with autocast_ctx:
-            logits = model(inputs) # B, N, S, V
-        logp = F.log_softmax(logits, dim=-1) # B, N, S, V
-        # we unsqueeze targets to (B, N, S, 1) so we can gather the log probs of the target tokens
-        target_log_probs = logp.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1) # B, N, S
-
-        loss = loss_function(target_log_probs, rewards, advantages)
-
+            logp = -model(inputs, targets, loss_reduction='none').view_as(inputs) # (N, T)
+        
+        # Calculate the policy gradient objective weighted by rewards or advantages
+        pg_obj = loss_function(logp, rewards, advantages)
+        
+        # Normalize by the number of valid tokens
         num_valid = (targets >= 0).sum().clamp(min=1)
-        loss = loss / num_valid
+        pg_obj = pg_obj / num_valid
+        
+        # Formulate the loss to minimize (negate the objective we want to maximize)
+        loss = -pg_obj
         loss.backward()
 
         for opt in optimizers:
@@ -133,7 +142,7 @@ def train(loss_function):
         model.zero_grad(set_to_none=True)
 
         if step % 10 == 0:
-            print0(f"Step {step}/{num_steps} | Loss: {loss.item():.4f} | Avg Reward: {rewards.mean().item():.2f}")
+            print(f"Step {step}/{num_steps} | Loss: {loss.item():.4f} | Avg Reward: {rewards.mean().item():.2f}")
 
 
 if __name__ == "__main__":

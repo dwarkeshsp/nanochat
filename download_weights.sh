@@ -32,6 +32,8 @@ cd "$CHECKPOINT_DIR"
 echo ""
 echo "=== Setting up Python environment ==="
 cd "$(dirname "$0")"
+# install uv (if not already installed)
+command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 
 echo ""
