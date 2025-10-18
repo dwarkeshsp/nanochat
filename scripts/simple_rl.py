@@ -1,11 +1,13 @@
 """
-Simple RL training script for teaching a model to add two numbers.
+Simple RL training script for teaching a model to add two three-digit numbers.
 Demonstrates REINFORCE and GRPO algorithms in a minimal, clean implementation.
 """
 import random
+import time
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 from nanochat.common import compute_init, compute_cleanup
 from nanochat.checkpoint_manager import load_model
@@ -13,20 +15,26 @@ from nanochat.engine import Engine
 
 
 # Config
-num_steps = 10
-problems_per_batch = 4
-samples_per_problem = 16  
+num_steps = 25
+problems_per_batch = 16
+samples_per_problem = 16
 max_new_tokens = 256  
 temperature = 1.0  
-top_k = 50 
+top_k = 50
+
+# Randomly split numbers into train/val sets
+all_numbers = list(range(100, 1000))
+random.shuffle(all_numbers)
+val_numbers = set(all_numbers[:100])  # 100 numbers for validation
+train_numbers = set(all_numbers[100:])  # 800 numbers for training
 
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
 
-def generate_prompt_and_answer(tokenizer):
-    a = random.randint(1, 100)
-    b = random.randint(1, 100)
+def generate_prompt_and_answer(tokenizer, number_set):    
+    a = random.choice(list(number_set))
+    b = random.choice(list(number_set))
     question_text = f"Compute the sum of {a} and {b}."
     
     SOT_USER = tokenizer.encode_special("<|user_start|>")
@@ -37,12 +45,12 @@ def generate_prompt_and_answer(tokenizer):
     return prompt_tokens, str(a + b)
 
 @torch.no_grad()
-def get_problem(engine, tokenizer):
+def get_problem(engine, tokenizer, number_set):
     """Generator that yields problems with multiple samples and rewards."""
     EOT_MODEL = tokenizer.encode_special("<|assistant_end|>")
     
     while True:
-        prompt_tokens, correct_answer = generate_prompt_and_answer(tokenizer)
+        prompt_tokens, correct_answer = generate_prompt_and_answer(tokenizer, number_set)
         prefix_length = len(prompt_tokens)
 
         with autocast_ctx:
@@ -81,27 +89,41 @@ def GRPO_loss(log_probs, rewards, advantages):
     """GRPO: weight by advantages (centered rewards)."""
     return (log_probs * advantages.unsqueeze(-1)).sum()
 
-def train(loss_function, algorithm_name):
+@torch.no_grad()
+def evaluate(engine, tokenizer, num_problems=problems_per_batch):
+    """Evaluate on validation set."""
+    problem_iterator = get_problem(engine, tokenizer, number_set=val_numbers)
+    total_reward = 0
+    
+    for _ in range(num_problems):
+        _, _, _, rewards, _ = next(problem_iterator)
+        total_reward += rewards.mean().item()
+    
+    return total_reward / num_problems
+
+def train(loss_function):
     model, tokenizer, _ = load_model('sft', device, phase="eval")
     engine = Engine(model, tokenizer)
     optimizers = model.setup_optimizers(
         unembedding_lr=0.0004, embedding_lr=0.02, matrix_lr=0.002, weight_decay=0.0
     )
     
-    problem_iterator = get_problem(engine, tokenizer)
-    reward_history = []
+    problem_iterator = get_problem(engine, tokenizer, number_set=train_numbers)
+    train_rewards, val_rewards = [], []
     
     for step in range(num_steps):
+        step_start = time.time()
         rewards_list = []
+        seq_lens = []
         
         for problem in range(problems_per_batch):
             sequences, inputs, targets, rewards, advantages = next(problem_iterator)
             
             model.train()
             with autocast_ctx:
-                logp = -model(inputs, targets, loss_reduction='none').view_as(inputs) # (N, T)
+                logp = -model(inputs, targets, loss_reduction='none').view_as(inputs)
             
-            pg_obj = loss_function(logp, rewards, advantages) 
+            pg_obj = loss_function(logp, rewards, advantages)
             num_valid = (targets >= 0).sum().clamp(min=1)
             pg_obj = pg_obj / (num_valid * problems_per_batch)
             
@@ -109,34 +131,66 @@ def train(loss_function, algorithm_name):
             loss.backward()
             
             rewards_list.append(rewards.mean().item())
+            seq_lens.append(len(sequences[0]))
         
         for opt in optimizers:
             opt.step()
         model.zero_grad(set_to_none=True)
-        
-        mean_reward = sum(rewards_list) / len(rewards_list)
-        reward_history.append(mean_reward)
-       
-        print(f"{algorithm_name} | Step {step}/{num_steps} | Avg Reward: {mean_reward:.2f}")
-    
-    return reward_history
 
-def plot_rewards(reinforce_rewards, grpo_rewards):
-    plt.figure(figsize=(10, 6))
-    plt.plot(reinforce_rewards, label='REINFORCE', linewidth=2)
-    plt.plot(grpo_rewards, label='GRPO', linewidth=2)
-    plt.xlabel('Training Step'), plt.ylabel('Average Reward')
-    plt.title('RL Algorithm Comparison: Addition Task')
-    plt.legend(), plt.grid(alpha=0.3)
-    plt.savefig('rl_comparison.png', dpi=150, bbox_inches='tight')
-    print("\n✓ Saved comparison plot to rl_comparison.png")
+        # the rest of this is just logging
+        train_reward = sum(rewards_list) / len(rewards_list)
+        train_rewards.append(train_reward)
+
+        val_reward = evaluate(engine, tokenizer) if step % 5 == 0 else None
+        val_rewards.append(val_reward)
+        
+        avg_seq_len = sum(seq_lens) / len(seq_lens)
+        step_time = time.time() - step_start
+        
+        log_msg = f"Step {step}/{num_steps} | Train: {train_reward:.2f} | Time: {step_time:.1f}s | Seq Len: {round(avg_seq_len)}"
+        if val_reward is not None:
+            log_msg += f" | Val: {val_reward:.2f}"
+        print(log_msg)
+        
+    
+    return train_rewards, val_rewards
+
+def plot_rewards(reinforce_train, reinforce_val, grpo_train, grpo_val):
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    steps = range(len(reinforce_train))
+    ax.plot(steps, reinforce_train, '-', color='blue')
+    ax.plot(steps, grpo_train, '-', color='orange')
+    
+    val_steps = [i for i, v in enumerate(reinforce_val) if v is not None]
+    r_val = [v for v in reinforce_val if v is not None]
+    g_val = [v for v in grpo_val if v is not None]
+    ax.plot(val_steps, r_val, 'o--', color='blue', alpha=0.6)
+    ax.plot(val_steps, g_val, 'o--', color='orange', alpha=0.6)
+    
+    # Dual legends
+    algo_handles = [Line2D([0], [0], color=c, lw=2, label=l) 
+                    for c, l in [('blue', 'REINFORCE'), ('orange', 'GRPO')]]
+    split_handles = [Line2D([0], [0], color='gray', lw=2, ls=ls, marker=m, label=l)
+                     for ls, m, l in [('-', '', 'train'), ('--', 'o', 'val')]]
+    
+    first_legend = ax.legend(handles=algo_handles, loc='upper left')
+    ax.add_artist(first_legend)
+    ax.legend(handles=split_handles, loc='upper right')
+    
+    ax.set(xlabel='Training Step', ylabel='Avg Reward', 
+           title='RLing Nanochat to add 3-digit numbers')
+    ax.grid(alpha=0.3)
+    fig.savefig('simple_rl_training_curves.png', dpi=150, bbox_inches='tight')
+    print("\nSaved plot to simple_rl_training_curves.png")
 
 if __name__ == "__main__":
-    reinforce_rewards = train(REINFORCE_loss, "REINFORCE")
-    grpo_rewards = train(GRPO_loss, "GRPO")
-
-    plot_rewards(reinforce_rewards, grpo_rewards)
+    print("Training REINFORCE...")  
+    reinforce_train, reinforce_val = train(REINFORCE_loss)
+    print("Training GRPO...")
+    grpo_train, grpo_val = train(GRPO_loss)
     
+    plot_rewards(reinforce_train, reinforce_val, grpo_train, grpo_val)
     compute_cleanup()
 
 
