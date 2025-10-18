@@ -12,9 +12,9 @@ from nanochat.engine import Engine
 
 
 # Config
-num_steps = 1 
-problems_per_batch = 4  
-samples_per_problem = 4  
+num_steps = 50
+problems_per_batch = 8
+samples_per_problem = 16  
 max_new_tokens = 64  
 temperature = 1.0  
 top_k = 50 
@@ -36,8 +36,8 @@ EOT_MODEL = tokenizer.encode_special("<|assistant_end|>")
 
 
 def generate_prompt_and_answer():
-    a = random.randint(10, 100)
-    b = random.randint(10, 100)
+    a = random.randint(1, 100)
+    b = random.randint(1, 100)
     
     # Build prompt tokens correctly (tokenizer.encode returns a list!)
     question_text = f"Compute the sum of {a} and {b}."
@@ -49,12 +49,12 @@ def generate_prompt_and_answer():
     return prompt_tokens, correct_answer
 
 @torch.no_grad()
-def get_batch():
+def get_problem():
     """
-    Generator that yields batches for RL training.
-    For each problem, generates multiple samples and computes rewards.
+    Generator that yields a problem and generates multiple samples and computes rewards.
     """
-    for problem in range(problems_per_batch):
+    while True: # loop forever
+
         prompt_tokens, correct_answer = generate_prompt_and_answer()
         prefix_length = len(prompt_tokens)
 
@@ -71,7 +71,6 @@ def get_batch():
         for sample_tokens in generated_token_sequences:
             generated_tokens = sample_tokens[prefix_length:]
             generated_text = tokenizer.decode(generated_tokens)
-            print(f"generated text: {generated_text}")
             # Simple reward: 1.0 if answer is in the text, 0.0 otherwise
             reward = 1.0 if correct_answer in generated_text else 0.0
             rewards.append(reward)
@@ -92,11 +91,6 @@ def get_batch():
         # Compute advantages
         rewards = torch.tensor(rewards, dtype=torch.float, device=device)  # (N,)
         advantages = rewards - rewards.mean() 
-        print(f"generated_token_sequences shape: {len(generated_token_sequences)} x {[len(seq) for seq in generated_token_sequences]}")
-        print(f"inputs shape: {inputs.shape}")
-        print(f"targets shape: {targets.shape}")
-        print(f"rewards shape: {rewards.shape}")
-        print(f"advantages shape: {advantages.shape}")
             
         yield generated_token_sequences, inputs, targets, rewards, advantages
 
@@ -109,41 +103,40 @@ def GRPO_loss(log_probs, rewards, advantages):
     return (log_probs * advantages.unsqueeze(-1)).sum()
 
 optimizers = model.setup_optimizers(
-    unembedding_lr=0.004,
-    embedding_lr=0.2,
-    matrix_lr=0.02,
+    unembedding_lr=0.0004,  # was 0.004
+    embedding_lr=0.02,      # was 0.2
+    matrix_lr=0.002,        # was 0.02
     weight_decay=0.0,
 )
 
 def train(loss_function):
-    batch_iterator = get_batch()
+    problem_iterator = get_problem()
     for step in range(num_steps):
-        sequences, inputs, targets, rewards, advantages = next(batch_iterator)
-
-        model.train()
-
-        # Calculate log probabilities. Note that the model returns NLL = -logp, so we negate
-        with autocast_ctx:
-            logp = -model(inputs, targets, loss_reduction='none').view_as(inputs) # (N, T)
+        rewards_list = []  
         
-        # Calculate the policy gradient objective weighted by rewards or advantages
-        pg_obj = loss_function(logp, rewards, advantages)
+        for problem in range(problems_per_batch):
+            sequences, inputs, targets, rewards, advantages = next(problem_iterator)
+            
+            model.train()
+            with autocast_ctx:
+                logp = -model(inputs, targets, loss_reduction='none').view_as(inputs)
+            
+            pg_obj = loss_function(logp, rewards, advantages)
+            num_valid = (targets >= 0).sum().clamp(min=1)
+            pg_obj = pg_obj / (num_valid * problems_per_batch)
+            
+            loss = -pg_obj
+            loss.backward()
+            
+            rewards_list.append(rewards.mean().item())
         
-        # Normalize by the number of valid tokens
-        num_valid = (targets >= 0).sum().clamp(min=1)
-        pg_obj = pg_obj / num_valid
-        
-        # Formulate the loss to minimize (negate the objective we want to maximize)
-        loss = -pg_obj
-        loss.backward()
-
+        # Step optimizer after all problems
         for opt in optimizers:
             opt.step()
         model.zero_grad(set_to_none=True)
-
-        if step % 10 == 0:
-            print(f"Step {step}/{num_steps} | Loss: {loss.item():.4f} | Avg Reward: {rewards.mean().item():.2f}")
-
+        
+        mean_reward = sum(rewards_list) / len(rewards_list)
+        print(f"Step {step}/{num_steps} | Loss: {loss.item():.4f} | Avg Reward: {mean_reward:.2f}")
 
 if __name__ == "__main__":
     train(GRPO_loss)
