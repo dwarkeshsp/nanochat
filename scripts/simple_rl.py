@@ -1,5 +1,5 @@
 """
-Simple RL training script for teaching a model to add two three-digit numbers.
+Simple RL training script for teaching a model to add.
 Demonstrates REINFORCE and GRPO algorithms in a minimal, clean implementation.
 """
 import random
@@ -16,18 +16,21 @@ from nanochat.engine import Engine
 
 
 # Config
-num_steps = 26
+num_steps = 16
 problems_per_step = 16
 samples_per_problem = 16
 max_new_tokens = 256  
 temperature = 1.0  
 top_k = 50
 
+max_addend = int(1e5)
+fraction_val = 0.1
+len_val_addends = int(max_addend * fraction_val)
 # Randomly split numbers into train/val sets
-all_numbers = list(range(100, 1000))
+all_numbers = list(range(max_addend))
 random.shuffle(all_numbers)
-val_numbers = set(all_numbers[:100])  # 100 numbers for validation
-train_numbers = set(all_numbers[100:])  # 800 numbers for training
+val_numbers = set(all_numbers[:len_val_addends])
+train_numbers = set(all_numbers[len_val_addends:])
 
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -108,6 +111,7 @@ def train(loss_function):
     optimizers = model.setup_optimizers(
         unembedding_lr=0.0004, embedding_lr=0.02, matrix_lr=0.002, weight_decay=0.0
     )
+    python_start = tokenizer.encode_special("<|python_start|>")
     
     problem_iterator = get_problem(engine, tokenizer, number_set=train_numbers)
     train_rewards, val_rewards = [], []
@@ -116,6 +120,7 @@ def train(loss_function):
         step_start = time.time()
         rewards_list = []
         seq_lens = []
+        seqs_with_python = 0
         
         for problem in range(problems_per_step):
             sequences, inputs, targets, rewards, advantages = next(problem_iterator)
@@ -133,6 +138,8 @@ def train(loss_function):
             
             rewards_list.append(rewards.mean().item())
             seq_lens.append(len(sequences[0]))
+            seqs_with_python += sum(python_start in seq for seq in sequences)
+
         
         for opt in optimizers:
             opt.step()
@@ -147,8 +154,9 @@ def train(loss_function):
         
         avg_seq_len = sum(seq_lens) / len(seq_lens)
         step_time = time.time() - step_start
+        frac_seqs_with_python = seqs_with_python / (problems_per_step * samples_per_problem)
         
-        log_msg = f"Step {step + 1}/{num_steps} | Train: {train_reward:.2f} | Time: {step_time:.1f}s | Seq Len: {round(avg_seq_len)}"
+        log_msg = f"Step {step + 1}/{num_steps} | Train: {train_reward:.2f} | Time: {step_time:.1f}s | Seq Len: {round(avg_seq_len)} | Python Use: {frac_seqs_with_python:.2f}"
         if val_reward is not None:
             log_msg += f" | Val: {val_reward:.2f}"
         print(log_msg)
@@ -156,16 +164,18 @@ def train(loss_function):
     return model, train_rewards, val_rewards
 
 def save_model(model, name):
-    checkpoint_dir = os.path.join(get_base_dir(), name)
+    base_dir = get_base_dir()
+    depth = model.config.n_layer
+    model_tag = f"d{depth}"
+    checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", f"{model_tag}_{name}")
     save_checkpoint(
         checkpoint_dir,
         num_steps,
         model.state_dict(),
         None,
-        {
-            "model_config": model.config.__dict__,
-        }
+        {"model_config": model.config.__dict__}
     )
+    print(f"✅ Saved {name} model to {checkpoint_dir}")
 
 def plot_rewards(reinforce_train, reinforce_val, grpo_train, grpo_val):
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -191,7 +201,7 @@ def plot_rewards(reinforce_train, reinforce_val, grpo_train, grpo_val):
     ax.legend(handles=split_handles, loc='upper right')
     
     ax.set(xlabel='Training Step', ylabel='Avg Reward', 
-           title='RLing Nanochat to add 3-digit numbers')
+           title='RLing Nanochat to add 5-digit numbers')
     ax.grid(alpha=0.3)
     fig.savefig('simple_rl_training_curves.png', dpi=150, bbox_inches='tight')
     print("\nSaved plot to simple_rl_training_curves.png")
