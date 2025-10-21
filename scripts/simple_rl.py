@@ -1,6 +1,19 @@
 """
 Simple RL training script for teaching a model to add.
-Demonstrates REINFORCE and GRPO algorithms in a minimal, clean implementation.
+Demonstrates REINFORCE and GRPO algorithms in a minimal implementation.
+
+If you want to run this script, put it inside of nanochat/scripts/ and run it with:
+python -m scripts.simple_rl
+
+First add "matplotlib>=3.9.0" to pyproject.toml and run 'uv sync'
+
+I wrote a separate script to download the weights for the model: 
+https://gist.github.com/dwarkeshsp/7b456da6e219d2a0b0d45587d15c3421
+
+Fundamentally, it's not that complicated: generate multiple trajectories per prompt ("Compute 12,323 + 43,765 ="). 
+Mask out the prompt. Pad the trajectories to be of equal length. 
+Find out what (log) probability your model put on every single token generated in the trajectories. 
+Update your model to make it more likely that it produces the tokens in successful trajectories.
 """
 import random
 import time
@@ -119,9 +132,8 @@ def train(loss_function):
     for step in range(num_steps):
         step_start = time.time()
         rewards_list = []
-        seq_lens = []
         seqs_with_python = 0
-        
+
         for problem in range(problems_per_step):
             sequences, inputs, targets, rewards, advantages = next(problem_iterator)
             
@@ -132,15 +144,14 @@ def train(loss_function):
             pg_obj = loss_function(logp, rewards, advantages)
             num_valid = (targets >= 0).sum().clamp(min=1)
             pg_obj = pg_obj / (num_valid * problems_per_step)
-            
             loss = -pg_obj
-            loss.backward()
+            
             
             rewards_list.append(rewards.mean().item())
-            seq_lens.append(len(sequences[0]))
             seqs_with_python += sum(python_start in seq for seq in sequences)
 
-        
+            loss.backward()
+
         for opt in optimizers:
             opt.step()
         model.zero_grad(set_to_none=True)
@@ -152,11 +163,10 @@ def train(loss_function):
         val_reward = evaluate(engine, tokenizer) if step % 5 == 0 else None
         val_rewards.append(val_reward)
         
-        avg_seq_len = sum(seq_lens) / len(seq_lens)
         step_time = time.time() - step_start
         frac_seqs_with_python = seqs_with_python / (problems_per_step * samples_per_problem)
         
-        log_msg = f"Step {step + 1}/{num_steps} | Train: {train_reward:.2f} | Time: {step_time:.1f}s | Seq Len: {round(avg_seq_len)} | Python Use: {frac_seqs_with_python:.2f}"
+        log_msg = f"Step {step + 1}/{num_steps} | Train: {train_reward:.2f} | Python Use: {frac_seqs_with_python:.2f} | Time: {step_time:.1f}s"
         if val_reward is not None:
             log_msg += f" | Val: {val_reward:.2f}"
         print(log_msg)
